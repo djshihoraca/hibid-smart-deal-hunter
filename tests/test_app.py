@@ -23,6 +23,7 @@ def configured(monkeypatch, tmp_path):
     monkeypatch.setenv('DEAL_HUNTER_DB', str(tmp_path / 'data.sqlite3'))
     monkeypatch.delenv('VISION_API_KEY', raising=False)
     monkeypatch.delenv('RETAIL_API_URL', raising=False)
+    monkeypatch.delenv('REEFAPI_KEY', raising=False)
     return tmp_path / 'data.sqlite3'
 
 

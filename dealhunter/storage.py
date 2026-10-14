@@ -85,6 +85,9 @@ class Store:
                 CREATE TABLE IF NOT EXISTS photos (
                     inspection_id INTEGER NOT NULL REFERENCES inspections(id) ON DELETE CASCADE,
                     filename TEXT NOT NULL, content BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS auction_snapshots (
+                    id INTEGER PRIMARY KEY, owner TEXT NOT NULL, lot_id TEXT NOT NULL,
+                    payload TEXT NOT NULL, fetched_at TEXT NOT NULL, saved_at TEXT NOT NULL);
                 """)
         except sqlite3.Error as exc:
             raise StorageError("initialize-database", exc) from exc
@@ -140,3 +143,14 @@ class Store:
         with self.connect() as conn:
             return list(conn.execute("""SELECT p.filename,p.content FROM photos p JOIN inspections i
                 ON i.id=p.inspection_id WHERE i.owner=? AND i.id=?""", (self.owner(owner), record_id)))
+
+    def save_auction_snapshot(self, owner, lot, fetched_at):
+        with self.connect() as conn:
+            return conn.execute("INSERT INTO auction_snapshots(owner,lot_id,payload,fetched_at,saved_at) VALUES(?,?,?,?,?)",
+                                (self.owner(owner), str(lot['lot_id']), json.dumps(lot), fetched_at, utcnow())).lastrowid
+
+    def auction_snapshots(self, owner):
+        with self.connect() as conn:
+            return [{"id": i, "lot": json.loads(p), "fetched_at": f, "saved_at": s}
+                    for i, p, f, s in conn.execute("SELECT id,payload,fetched_at,saved_at FROM auction_snapshots WHERE owner=? ORDER BY id DESC LIMIT 200",
+                                                 (self.owner(owner),))]
