@@ -1,62 +1,371 @@
+"""Authenticated, mobile-friendly, manually operated auction dashboard."""
+import hashlib
+import base64
+import json
+import os
+import time
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
 import streamlit as st
-import json, datetime, os
-from decimal import Decimal
-st.set_page_config(page_title='HiBid Smart Deal Hunter',layout='wide')
+
+from dealhunter.calculator import calculate
+from dealhunter.inspection import CATEGORIES, CONDITIONS, assess, decide
+from dealhunter.integrations import https_url, live_retail, source_fresh, validate_photo, vision_photos
+from dealhunter.security import LoginLimiter, verify_password
+from dealhunter.storage import Store, utcnow
+
+st.set_page_config(page_title='HiBid Smart Deal Hunter', page_icon='🔎', layout='wide')
+st.markdown('''<style>
+@media (max-width: 640px) {
+ .block-container {padding: 1rem .8rem 3rem;}
+ div[data-testid="stHorizontalBlock"] {flex-direction: column;}
+ div[data-testid="stHorizontalBlock"] > div {width: 100% !important; flex: auto;}
+ button {min-height: 44px;}
+}
+</style>''', unsafe_allow_html=True)
 st.title('HiBid Smart Deal Hunter')
-st.caption('Local decision assistant • No automated scraping, login, or bidding')
+st.caption('Private decision assistant • Manual listing entry • No automated bidding')
+
+
+def setting(name, default=''):
+    value = os.environ.get(name)
+    if value is not None:
+        return value
+    try:
+        return st.secrets.get(name, default)
+    except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
+        return default
+
+
+@st.cache_resource
+def login_limiter():
+    return LoginLimiter()
+
+
+def authenticate():
+    try:
+        config = setting('DEAL_HUNTER_USERS', '{}')
+        users = json.loads(config) if isinstance(config, str) else dict(config)
+        if not isinstance(users, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in users.items()):
+            raise ValueError
+    except (ValueError, TypeError):
+        st.error('Invalid authentication configuration. Ask the application administrator to fix it.')
+        st.stop()
+    if not users:
+        st.info('Private data is locked. Configure DEAL_HUNTER_USERS with app usernames and password hashes. See README.')
+        st.stop()
+    auth = st.session_state.get('auth')
+    if auth and (time.time() - auth['last_seen'] > 1800 or users.get(auth['owner']) != auth['binding']):
+        st.session_state.clear()
+        auth = None
+    if not auth:
+        with st.form('login', clear_on_submit=True):
+            username = st.text_input('App username')
+            password = st.text_input('App password', type='password', help='Never use your HiBid password.')
+            submitted = st.form_submit_button('Sign in', use_container_width=True)
+        if submitted:
+            if time.time() < st.session_state.get('login_after', 0) or not login_limiter().allow(username):
+                st.error('Please wait before trying again.')
+            else:
+                binding = users.get(username, 'pbkdf2_sha256$600000$AAAAAAAAAAAAAAAAAAAAAA==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=')
+                valid = verify_password(password, binding)
+                if valid and username in users:
+                    st.session_state.clear()
+                    st.session_state.auth = {'owner': username, 'binding': binding, 'last_seen': time.time()}
+                    st.rerun()
+                else:
+                    st.session_state.login_after = time.time() + 3
+                    st.error('Invalid username or password.')
+        st.stop()
+    auth['last_seen'] = time.time()
+    with st.sidebar:
+        st.caption(f"Signed in as {auth['owner']}")
+        if st.button('Sign out', use_container_width=True):
+            st.session_state.clear()
+            st.rerun()
+    return auth['owner']
+
+
+owner = authenticate()  # No database or private dashboard before authentication.
+store = Store(setting('DEAL_HUNTER_DB', str(Path(__file__).parent / 'data' / 'dealhunter.sqlite3')))
+
+
+def lines(value):
+    return list(dict.fromkeys(x.strip() for x in value.splitlines() if x.strip()))
+
+
+def fingerprint(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def money(value):
+    return f'${value:.2f}'
+
+
+def display_time(value):
+    return datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone(ZoneInfo('America/Toronto')).strftime('%Y-%m-%d %H:%M %Z')
+
+
+def show_photos(photos):
+    # Inline bytes avoid Streamlit's unauthenticated /media resource endpoints.
+    from PIL import Image, ImageOps
+    import io
+    for _, raw in photos:
+        with Image.open(io.BytesIO(raw)) as image:
+            image = ImageOps.exif_transpose(image).convert('RGB')
+            image.thumbnail((1200, 1200))
+            buffer = io.BytesIO()
+            image.save(buffer, format='JPEG', quality=85)
+        encoded = base64.b64encode(buffer.getvalue()).decode()
+        st.markdown(f'<img alt="Private listing photo" style="max-width:100%;width:300px" src="data:image/jpeg;base64,{encoded}">', unsafe_allow_html=True)
+
+
+def download_record(record, filename):
+    # Only generated base64 and controlled filenames enter this HTML.
+    payload = base64.b64encode(json.dumps(record, indent=2).encode()).decode()
+    st.markdown(f'<a download="{filename}" href="data:application/json;base64,{payload}">Download inspection report (JSON)</a>', unsafe_allow_html=True)
+
+
+watchlists = store.watchlists(owner)
 with st.sidebar:
- st.header('Agent settings')
- postal=st.text_input('Search centre','L7A 4X1')
- radius=st.number_input('Pickup radius (km)',1,500,50)
- discount=st.slider('Required discount (%)',0,95,70)
- categories=st.multiselect('Categories',['Toys & Games','Electronics','Power Tools','Home Appliances','Furniture & Décor','Lawn & Garden','Automotive','Computers','Sports & Outdoors','Other'],default=['Toys & Games','Electronics','Power Tools'])
- watch=st.text_area('Specific items / model numbers (one per line)')
- st.info('Use HiBid filters manually to find lots. Paste listing details below for inspection.')
-st.header('Inspect an auction listing')
-url=st.text_input('HiBid listing URL')
-name=st.text_input('Exact item name / model')
-condition=st.multiselect('Claimed conditions',['Factory sealed','New open-box','Like new','Used excellent','Used good','Refurbished','Display model','Customer return','Damaged packaging','For parts / not working'])
-description=st.text_area('Full seller description',height=160)
-photos=st.file_uploader('Upload listing photos for your own inspection record',type=['png','jpg','jpeg','webp'],accept_multiple_files=True)
-if photos:
- st.image([p.getvalue() for p in photos],width=180)
- st.warning('Photos are displayed for manual review. This local v1 does not perform AI visual analysis or verify functionality.')
-retail_url=st.text_input('Retail comparison URL (exact matching item)')
-a,b,c=st.columns(3)
-with a: retail=st.number_input('Lowest verified comparable price (CAD, before tax)',min_value=0.0,value=100.0,step=5.0)
-with b: premium=st.number_input('Buyer premium (%)',0.0,100.0,15.0)
-with c: tax=st.number_input('Applicable sales tax (%)',0.0,30.0,13.0)
-d,e,f=st.columns(3)
-with d: shipping=st.number_input('Mandatory shipping/pickup fees (CAD)',0.0,value=0.0)
-with e: current=st.number_input('Current hammer bid (CAD)',0.0,value=0.0)
-with f: increments=st.number_input('Bid increment (CAD)',0.01,value=1.0)
-retail_delivery=st.number_input('Retail delivery cost (CAD)',min_value=0.0,value=0.0)
-retail_total=retail*(1+tax/100)+retail_delivery
-ceiling=retail_total*(1-discount/100)
-max_hammer=max(0,(ceiling-shipping)/((1+premium/100)*(1+tax/100)))
-max_hammer=(int((max_hammer+1e-9)/increments))*increments
-current_total=current*(1+premium/100)*(1+tax/100)+shipping
-savings=100*(1-current_total/retail_total) if retail_total else 0
-st.divider()
-x,y,z=st.columns(3)
-x.metric('Retail delivered total',f'${retail_total:.2f}')
-y.metric('Maximum hammer bid',f'${max_hammer:.2f}')
-z.metric('Savings at current bid',f'{savings:.1f}%')
-flags=[]
-keywords=['untested','as is','as-is','no returns','missing','damaged','broken','not working','parts only','unknown condition','stock photo','open box','refurbished']
-for k in keywords:
- if k in description.lower(): flags.append(k)
-if not retail_url: flags.append('retail source not provided')
-if not name: flags.append('model not identified')
-if not description: flags.append('description missing')
-if not photos: flags.append('photos not supplied')
-if flags: st.warning('Manual review flags: '+', '.join(flags))
-if current_total<=ceiling and retail_total>0:
- st.success('Price meets the discount target, subject to manual verification and bidding rules.')
-else: st.error('Price does not meet the discount target. Approval required to exceed ceiling.')
-st.write('**Inspection checklist:** exact model matches; packaging and seals visible; accessories present; no description/photo contradictions; seller terms checked; location within radius; retail listing in stock; condition comparable.')
-notes=st.text_area('Photo inspection findings / missing accessories / pickup notes')
-record={'saved_at':datetime.datetime.now().isoformat(timespec='seconds'),'listing_url':url,'name':name,'condition':condition,'description':description,'retail_url':retail_url,'retail_before_tax':retail,'retail_delivered_total':round(retail_total,2),'max_hammer_bid':round(max_hammer,2),'current_bid':current,'current_all_in':round(current_total,2),'savings_percent':round(savings,2),'flags':flags,'notes':notes,'categories':categories,'specific_watchlist':watch.splitlines(),'postal':postal,'radius_km':radius,'required_discount_percent':discount,'photo_filenames':[p.name for p in photos or []]}
-st.download_button('Download inspection report (JSON)',json.dumps(record,indent=2),file_name='hibid_inspection.json',mime='application/json')
-if url: st.link_button('Open HiBid listing to review / bid manually',url)
-st.caption('Not affiliated with HiBid. Prices are user-entered, not live verified. Do not enter credentials here. A maximum bid is not an authorization to bid.')
+    st.header('Watchlists')
+    selected = st.selectbox('Saved watchlist', ['New watchlist'] + [w['name'] for w in watchlists])
+    watch = next((w for w in watchlists if w['name'] == selected), {})
+    ns = 'watch:' + selected
+    watch_name = st.text_input('Watchlist name', value=watch.get('name', ''), key=ns + ':name')
+    categories = st.multiselect('Categories', CATEGORIES, default=watch.get('categories', CATEGORIES[:3]), key=ns + ':categories')
+    brands = st.text_area('Brands (one per line)', value='\n'.join(watch.get('brands', [])), key=ns + ':brands')
+    models = st.text_area('Models (one per line)', value='\n'.join(watch.get('models', [])), key=ns + ':models')
+    keywords = st.text_area('Keywords (one per line)', value='\n'.join(watch.get('keywords', [])), key=ns + ':keywords')
+    accepted = st.multiselect('Acceptable conditions', CONDITIONS, default=watch.get('conditions', CONDITIONS[:3]), key=ns + ':conditions')
+    postal = st.text_input('Search centre', value=watch.get('postal', 'L7A 4X1'), key=ns + ':postal')
+    radius = st.number_input('Pickup radius (km)', 1, 500, value=watch.get('radius_km', 50), key=ns + ':radius')
+    watch_payload = {'categories': categories, 'brands': lines(brands), 'models': lines(models),
+                     'keywords': lines(keywords), 'conditions': accepted, 'postal': postal, 'radius_km': radius}
+    if st.button('Save watchlist', use_container_width=True):
+        if watch_name.strip() and accepted:
+            store.save_watchlist(owner, watch_name, watch_payload)
+            st.success('Watchlist saved. It will appear in the saved list on your next interaction.')
+        else:
+            st.error('Enter a name and at least one acceptable condition.')
+    discount = st.slider('Required savings (%)', 70, 95, 70)
+    st.info('Search HiBid manually. Watchlists store preferences; they do not monitor auctions.')
+
+inspect_tab, history_tab = st.tabs(['Inspect listing', 'Inspection history'])
+with inspect_tab:
+    st.header('Inspect an auction listing')
+    url = st.text_input('HiBid listing URL')
+    name = st.text_input('Exact item name / model')
+    category = st.selectbox('Listing category', CATEGORIES)
+    brand = st.text_input('Listing brand')
+    condition = st.multiselect('Claimed conditions', CONDITIONS)
+    description = st.text_area('Full seller description', height=160)
+    uploads = st.file_uploader('Listing photos (up to 5, 10 MB each)', type=['png', 'jpg', 'jpeg', 'webp'], accept_multiple_files=True)
+    photos = []
+    if len(uploads or []) > 5:
+        st.error('Upload at most five photos.')
+        st.stop()
+    for uploaded in uploads or []:
+        raw = uploaded.getvalue()
+        try:
+            validate_photo(raw)
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
+        photos.append((Path(uploaded.name).name, raw))
+    if photos:
+        show_photos(photos)
+    st.warning('Photos may show visible concerns. They never prove functionality, authenticity, or absence of hidden defects.')
+    vision_key = fingerprint({'description': description, 'conditions': condition,
+                              'photos': [(n, hashlib.sha256(b).hexdigest()) for n, b in photos]})
+    with st.expander('Photo inspection', expanded=True):
+        reviewed = st.checkbox('I reviewed the uploaded photos manually', key='reviewed:' + vision_key)
+        damage = st.checkbox('Visible damage', key='damage:' + vision_key)
+        missing = st.checkbox('Missing accessories', key='missing:' + vision_key)
+        inconsistent = st.checkbox('Photo / description condition inconsistency', key='inconsistent:' + vision_key)
+        notes = st.text_area('Photo findings, missing accessories and uncertainty', key='notes:' + vision_key)
+        if setting('VISION_API_KEY'):
+            consent = st.checkbox('Send these photos and seller claims to the configured OpenAI photo service')
+            if st.button('Analyze photos', disabled=not (consent and photos)):
+                try:
+                    with st.spinner('Inspecting visible evidence…'):
+                        result = vision_photos(photos, description, condition, setting('VISION_API_KEY'), setting('VISION_MODEL', 'gpt-4.1-mini'))
+                    st.session_state.vision = {'key': vision_key, 'result': result}
+                except Exception:
+                    st.session_state.pop('vision', None)
+                    st.error('Photo analysis failed. No AI assessment is available; continue manual inspection.')
+        else:
+            st.caption('Optional AI photo analysis needs VISION_API_KEY. Manual observations are stored as manual assessments.')
+    vision_state = st.session_state.get('vision', {})
+    vision = vision_state.get('result') if vision_state.get('key') == vision_key else None
+    observations = {'reviewed': bool(reviewed and photos), 'damage': damage, 'missing': missing,
+                    'inconsistent': inconsistent, 'notes': notes}
+    assessment = assess(description, condition, len(photos), observations, vision)
+    for flag in assessment['flags']:
+        st.caption('• ' + flag)
+
+    st.subheader('Canadian retail comparison')
+    retail_condition = st.selectbox('Comparable retail condition', CONDITIONS)
+    source_mode = st.radio('Price source', ['Manual entry', 'Live authorized retailer API'], horizontal=True)
+    retail_tax = st.number_input('Retail sales tax (%)', 0.0, 100.0, 13.0)
+    source = {}
+    if source_mode == 'Manual entry':
+        retail_url = st.text_input('Retail comparison URL (exact matching item)')
+        retailer = st.text_input('Canadian retailer name')
+        retail_model = st.text_input('Retail model number')
+        retail = st.number_input('Comparable price (CAD, before tax)', min_value=0.0, value=100.0, step=5.0)
+        retail_delivery = st.number_input('Retail delivery cost (CAD, tax included)', min_value=0.0, value=0.0)
+        manual_scope = fingerprint({'url': retail_url, 'retailer': retailer, 'retail_model': retail_model,
+                                    'listing_model': name, 'condition': retail_condition, 'claims': condition,
+                                    'price': retail, 'delivery': retail_delivery})
+        manual_verified = st.checkbox('I checked this source: exact model, equivalent condition, in stock in Canada, price in CAD', key='manual:' + manual_scope)
+        valid_manual = bool(manual_verified and https_url(retail_url) and retailer.strip()
+                            and name.strip() and retail_model.strip().casefold() == name.strip().casefold()
+                            and retail_condition in condition and retail > 0)
+        if valid_manual and st.session_state.get('manual_check', {}).get('scope') != manual_scope:
+            st.session_state.manual_check = {'scope': manual_scope, 'checked_at': utcnow()}
+        source = {'kind': 'manual_verified' if valid_manual else 'manual_unverified', 'verified': valid_manual,
+                  'model': retail_model, 'condition': retail_condition, 'country': 'CA', 'currency': 'CAD',
+                  'price': retail, 'delivery': retail_delivery, 'url': retail_url, 'retailer': retailer,
+                  'checked_at': st.session_state.manual_check['checked_at'] if valid_manual else None, 'in_stock': valid_manual}
+        st.info('Manually verified by you; not a live price.' if valid_manual else 'Manually entered price — unverified.')
+    else:
+        retail_key = fingerprint({'model': name, 'condition': retail_condition})
+        endpoint = setting('RETAIL_API_URL')
+        if not endpoint:
+            st.info('Configure RETAIL_API_URL for an authorized Canadian retail adapter. No scraping is performed.')
+        if st.button('Verify live retail price', disabled=not (endpoint and name.strip() and retail_condition in condition)):
+            st.session_state.pop('retail', None)
+            try:
+                with st.spinner('Checking authorized retail source…'):
+                    result = live_retail(endpoint, setting('RETAIL_API_KEY'), model=name, condition=retail_condition)
+                st.session_state.retail = {'key': retail_key, 'source': result}
+            except Exception:
+                st.error('No live price verified. Check adapter configuration and exact model / condition match.')
+        live = st.session_state.get('retail', {})
+        source = live.get('source', {}) if live.get('key') == retail_key else {}
+        if source and not source_fresh(source):
+            st.warning('Retail observation expired after 15 minutes. Verify it again.')
+            source = {}
+        if source:
+            st.success(f"Live verified: {source['retailer']} — {money(source['price'])} CAD. Observed {display_time(source['observed_at'])}")
+        retail, retail_delivery = source.get('price', 0), source.get('delivery', 0)
+
+    # Compare multiple exact-match sources within this listing inspection.
+    comparison_scope = fingerprint({'url': url, 'model': name, 'conditions': condition})
+    if st.session_state.get('comparison_scope') != comparison_scope:
+        st.session_state.comparison_scope = comparison_scope
+        st.session_state.price_sources = []
+    if st.button('Add verified source to comparison', disabled=not source.get('verified')):
+        st.session_state.price_sources = [s for s in st.session_state.price_sources if s['url'] != source['url']] + [source]
+    if st.session_state.price_sources and st.button('Clear comparison sources'):
+        st.session_state.price_sources = []
+    saved_sources = st.session_state.price_sources
+    candidates = [s for s in saved_sources if s.get('kind') != 'live_verified' or source_fresh(s)]
+    if source.get('verified'):
+        candidates = [s for s in candidates if s['url'] != source['url']] + [source]
+    if len(candidates) > 1:
+        source = min(candidates, key=lambda s: s['price'] * (1 + retail_tax / 100) + s['delivery'])
+        retail, retail_delivery = source['price'], source['delivery']
+        st.info(f"Using lowest available delivered comparison: {source['retailer']} ({source['kind'].replace('_', ' ')}).")
+        st.dataframe([{'Retailer': s['retailer'], 'Price CAD': s['price'], 'Delivery CAD': s['delivery'],
+                       'Verification': s['kind'], 'URL': s['url']} for s in candidates], hide_index=True, use_container_width=True)
+    elif candidates:
+        source = candidates[0]
+        retail, retail_delivery = source['price'], source['delivery']
+        if saved_sources:
+            st.info(f"Using saved comparison: {source['retailer']} — {money(source['price'])} CAD ({source['kind'].replace('_', ' ')}). Clear comparison sources to stop using it.")
+    comparison_sources = candidates or ([source] if source else [])
+
+    st.subheader('All-in bid calculation')
+    a, b = st.columns(2)
+    with a:
+        premium = st.number_input('Buyer premium (%)', 0.0, 100.0, 15.0)
+        auction_tax = st.number_input('Auction sales tax (%)', 0.0, 100.0, 13.0)
+        premium_taxable = st.checkbox('Buyer premium is taxable', value=True)
+        shipping = st.number_input('Mandatory shipping / pickup (CAD, before tax if taxable)', min_value=0.0, value=0.0)
+        shipping_taxable = st.checkbox('Shipping / pickup is taxable')
+    with b:
+        fees = st.number_input('Other mandatory fees (CAD, before tax if taxable)', min_value=0.0, value=0.0)
+        fees_taxable = st.checkbox('Other mandatory fees are taxable', value=True)
+        current = st.number_input('Proposed hammer bid (CAD)', min_value=0.0, value=0.0)
+        increment = st.number_input('Bid increment (CAD)', min_value=0.01, value=1.0)
+    terms = st.checkbox('I checked seller terms, tax treatment, pickup radius, exact model and equivalent condition')
+    functionality = st.checkbox('I accept the documented uncertainty; photos do not establish functionality')
+    inputs = dict(retail=retail, retail_tax=retail_tax, retail_delivery=retail_delivery,
+                  premium=premium, auction_tax=auction_tax, premium_taxable=premium_taxable,
+                  shipping=shipping, shipping_taxable=shipping_taxable, fees=fees,
+                  fees_taxable=fees_taxable, current=current, increment=increment, discount=discount)
+    calculation = calculate(**inputs)
+    x, y, z = st.columns(3)
+    x.metric('Retail delivered total', money(calculation['retail_total']))
+    y.metric('Maximum hammer bid', money(calculation['max_hammer']))
+    z.metric('Savings at proposed bid', f"{calculation['savings_percent']:.1f}%")
+    st.caption((f"Auction all-in: {money(calculation['current_total'])}. Target budget: {money(calculation['budget'])}. "
+                "Ceiling is floored to increment multiples; check the auction's actual bid ladder.").replace('$', r'\$'))
+    watch_match = (not categories or category in categories) and (not lines(brands) or brand.casefold() in {b.casefold() for b in lines(brands)})
+    watch_match = watch_match and (not lines(models) or name.casefold() in {m.casefold() for m in lines(models)})
+    watch_match = watch_match and (not lines(keywords) or any(k.casefold() in (name + ' ' + description).casefold() for k in lines(keywords)))
+    if not watch_match:
+        st.warning("Listing does not match the active watchlist's category, brand, model or keyword preferences.")
+    complete = bool(https_url(url) and name.strip() and description.strip() and condition and photos
+                    and terms and functionality and source.get('condition') in condition and watch_match)
+    decision = decide(calculation, assessment, source, complete=complete,
+                      accepted_conditions=accepted, claimed_conditions=condition)
+    getattr(st, {'eligible': 'success', 'requiring review': 'warning', 'rejected': 'error'}[decision['status']])(
+        'Decision: ' + decision['status'].capitalize())
+    for reason_text in decision['reasons']:
+        st.write('• ' + reason_text)
+    record = {'listing_url': url, 'name': name, 'category': category, 'brand': brand,
+              'conditions': condition, 'description': description, 'watchlist_name': watch_name,
+              'watchlist': watch_payload, 'assessment': assessment, 'price_sources': comparison_sources,
+              'selected_price_source': source,
+              'bid_inputs': inputs, 'calculation': {k: str(v) if not isinstance(v, bool) else v for k, v in calculation.items()},
+              'checklist': {'terms': terms, 'uncertainty_accepted': functionality, 'complete': complete},
+              'decision': decision, 'photo_filenames': [n for n, _ in photos],
+              'photo_sha256': [hashlib.sha256(raw).hexdigest() for _, raw in photos]}
+    if st.button('Save inspection', use_container_width=True):
+        if name.strip():
+            record_id = store.save_inspection(owner, record, photos)
+            st.success(f'Inspection #{record_id} saved privately.')
+        else:
+            st.error('Enter an exact item name / model before saving.')
+    if calculation['above_ceiling'] and calculation['affordable']:
+        st.warning('An exception requires manual review and never submits a bid.')
+        reason = st.text_area('Reason for exceeding this bid ceiling')
+        approval_label = f"I explicitly approve this {money(current)} hammer bid above the {money(calculation['max_hammer'])} ceiling"
+        approval = st.checkbox(approval_label.replace('$', r'\$'), key='approval:' + fingerprint(record))
+        if st.button('Approve this exception and save inspection', disabled=not (approval and reason.strip() and name.strip()), use_container_width=True):
+            record['decision'] = decide(calculation, assessment, source, complete=complete,
+                                         accepted_conditions=accepted, claimed_conditions=condition, approved=True)
+            if not record['decision']['approved']:
+                st.error('This listing cannot receive a ceiling exception under the active condition preferences.')
+            else:
+                record['approval'] = {'owner': owner, 'reason': reason.strip(), 'approved_at': utcnow(),
+                                      'scope_sha256': fingerprint(record)}
+                record_id = store.save_inspection(owner, record, photos)
+                st.success(f'Exception recorded in inspection #{record_id}; decision remains requiring review.')
+    download_record(record, 'hibid_inspection.json')
+    if https_url(url):
+        st.link_button('Open listing to review / bid manually', url, use_container_width=True)
+
+with history_tab:
+    st.header('Private inspection history')
+    st.caption('Latest 200 saved inspections. Each save is an immutable snapshot, including photos and any approval.')
+    history = store.history(owner)
+    if not history:
+        st.info('No inspections saved yet.')
+    if history:
+        by_id = {entry['id']: entry for entry in history}
+        chosen = st.selectbox('Saved inspection', list(by_id), format_func=lambda i: f"#{i} · {by_id[i]['name']} · {by_id[i]['decision']['status']}")
+        entry = by_id[chosen]
+        with st.expander(f"#{entry['id']} · {entry['name']} · {entry['decision']['status']} · {display_time(entry['created_at'])}"):
+            st.json(entry)
+            saved_photos = store.photos(owner, entry['id'])
+            if saved_photos:
+                show_photos(saved_photos)
+            download_record(entry, f"inspection_{entry['id']}.json")
+
+st.caption('Not affiliated with HiBid. No HiBid credentials are collected or stored. Eligibility is decision support, not authorization to bid.')
