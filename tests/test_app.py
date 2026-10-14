@@ -182,5 +182,36 @@ def test_storage_failure_is_actionable_and_does_not_open_another_database(config
     assert not at.number_input
     assert len(attempts) == 1
     assert not configured.exists()
-    assert 'Manage app' in at.error[0].value and 'DEAL_HUNTER_DB' in at.error[0].value
+    rendered_text = '\n'.join(e.value for e in at.markdown)
+    assert 'Manage app' in rendered_text and 'DEAL_HUNTER_DB' in rendered_text
+    assert 'environment variable DEAL_HUNTER_DB' in at.code[0].value
     assert 'private details' not in at.error[0].value
+    assert 'private details' not in at.code[0].value
+
+
+def test_temporary_recovery_requires_explicit_consent_and_keeps_original_path(configured, monkeypatch):
+    original_store = Store
+    attempted = []
+    recovery = configured.parent / 'recovery' / 'temporary.sqlite3'
+    def available_only_for_recovery(path):
+        attempted.append(path)
+        if path == configured:
+            raise PermissionError('private configured path')
+        return original_store(path)
+    monkeypatch.setattr('dealhunter.storage.Store', available_only_for_recovery)
+    monkeypatch.setattr('dealhunter.storage.temporary_database_path', lambda: recovery)
+    at = login()
+    assert widget(at, 'button', 'Use temporary storage for this session').disabled
+    assert not recovery.exists()
+    widget(at, 'checkbox', 'I understand temporary storage is separate and may lose records').check().run()
+    widget(at, 'button', 'Use temporary storage for this session').click().run()
+    assert not at.exception
+    assert recovery.exists() and not configured.exists()
+    assert any('Temporary session storage is active' in warning.value for warning in at.warning)
+    widget(at, 'text_input', 'Exact item name / model').set_value('Temporary inspection')
+    widget(at, 'button', 'Save inspection').click().run()
+    assert original_store(recovery).history('alice')[0]['name'] == 'Temporary inspection'
+    assert attempted[-1] == recovery
+    assert not configured.exists()
+    widget(at, 'button', 'Sign out').click().run()
+    assert 'temporary_storage' not in at.session_state

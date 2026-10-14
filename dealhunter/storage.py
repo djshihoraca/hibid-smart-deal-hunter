@@ -1,14 +1,52 @@
 """User-scoped SQLite records; no passwords, API keys, or HiBid credentials."""
 import json
+import errno
 import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+import tempfile
 
 
 def utcnow():
     return datetime.now(timezone.utc).isoformat()
+
+
+class StorageError(OSError):
+    """Safe diagnostic metadata, never database contents or raw configured paths."""
+    def __init__(self, stage, cause):
+        self.stage = stage
+        self.reason = storage_reason(cause)
+        super().__init__(f"{stage}: {self.reason}")
+
+
+def storage_reason(error):
+    if isinstance(error, StorageError):
+        return error.reason
+    sqlite_code = getattr(error, "sqlite_errorcode", 0) & 0xFF
+    if sqlite_code == sqlite3.SQLITE_READONLY:
+        return "database-read-only"
+    if sqlite_code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+        return "database-locked"
+    if sqlite_code in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB):
+        return "database-invalid"
+    if isinstance(error, PermissionError) or getattr(error, "errno", None) in (errno.EACCES, errno.EPERM):
+        return "permission-denied"
+    if getattr(error, "errno", None) == errno.EROFS:
+        return "filesystem-read-only"
+    if isinstance(error, (FileExistsError, NotADirectoryError, IsADirectoryError, ValueError)):
+        return "invalid-path"
+    if getattr(error, "errno", None) in (errno.ENOSPC, errno.EDQUOT):
+        return "storage-full"
+    if isinstance(error, sqlite3.Error):
+        return "database-unavailable"
+    return "filesystem-unavailable"
+
+
+def temporary_database_path():
+    # Each explicit recovery gets a private directory; no shared predictable /tmp file.
+    return Path(tempfile.mkdtemp(prefix="hibid-private-")) / "dealhunter.sqlite3"
 
 
 def database_path(configured=None, legacy_directory=None):
@@ -31,9 +69,13 @@ def database_path(configured=None, legacy_directory=None):
 class Store:
     def __init__(self, path):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with self.connect() as conn:
-            conn.executescript("""
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError as exc:
+            raise StorageError("create-directory", exc) from exc
+        try:
+            with self.connect() as conn:
+                conn.executescript("""
                 CREATE TABLE IF NOT EXISTS watchlists (
                     id INTEGER PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL,
                     payload TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(owner, name));
@@ -43,8 +85,13 @@ class Store:
                 CREATE TABLE IF NOT EXISTS photos (
                     inspection_id INTEGER NOT NULL REFERENCES inspections(id) ON DELETE CASCADE,
                     filename TEXT NOT NULL, content BLOB NOT NULL);
-            """)
-        os.chmod(self.path, 0o600)
+                """)
+        except sqlite3.Error as exc:
+            raise StorageError("initialize-database", exc) from exc
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError as exc:
+            raise StorageError("protect-database", exc) from exc
 
     @contextmanager
     def connect(self):
