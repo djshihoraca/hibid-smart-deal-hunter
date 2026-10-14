@@ -3,6 +3,7 @@ import hashlib
 import base64
 import json
 import os
+import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +15,7 @@ from dealhunter.calculator import calculate
 from dealhunter.inspection import CATEGORIES, CONDITIONS, assess, decide
 from dealhunter.integrations import https_url, live_retail, source_fresh, validate_photo, vision_photos
 from dealhunter.security import LoginLimiter, verify_password
-from dealhunter.storage import Store, utcnow
+from dealhunter.storage import Store, database_path, utcnow
 
 st.set_page_config(page_title='HiBid Smart Deal Hunter', page_icon='🔎', layout='wide')
 st.markdown('''<style>
@@ -89,7 +90,15 @@ def authenticate():
 
 
 owner = authenticate()  # No database or private dashboard before authentication.
-store = Store(setting('DEAL_HUNTER_DB', str(Path(__file__).parent / 'data' / 'dealhunter.sqlite3')))
+try:
+    store = Store(database_path(setting('DEAL_HUNTER_DB', None), Path(__file__).parent))
+except (OSError, sqlite3.Error, ValueError):
+    st.error('Private storage could not be opened. In Streamlit Cloud, open Manage app → Settings → Secrets '
+             'and remove DEAL_HUNTER_DB to use the default user storage, or set it to a real writable '
+             'database file path. The example /private/persistent path is not a provisioned volume. '
+             'If using an existing database, check its directory permissions and availability; do not '
+             'change paths without preserving your history. No alternate database has been opened.')
+    st.stop()
 
 
 def lines(value):
