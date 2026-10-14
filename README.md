@@ -17,8 +17,8 @@ The last command asks for a **new application password**, then prints its salted
 
 ```toml
 DEAL_HUNTER_USERS = '{"alice":"<generated hash>","bob":"<another generated hash>"}'
-# Optional: use an absolute path on a private persistent volume.
-DEAL_HUNTER_DB = "/private/persistent/dealhunter.sqlite3"
+# Optional: only configure DEAL_HUNTER_DB if you have an actual writable volume.
+# Otherwise omit it and use the default user storage directory.
 ```
 
 Then run:
@@ -77,7 +77,11 @@ Use the actual observation time with a timezone (the example expires). `price` i
 
 ## Data and security
 
-The default database is `data/dealhunter.sqlite3`, ignored by Git and created with owner-only file permissions. Mount a persistent private volume for durable hosted storage; ephemeral deployment filesystems lose history. Back up the database consistently (SQLite backup API or stop the app before copying). The database is not encrypted at rest: host filesystem access is an administrator privilege. There is no HiBid account/password field and no credential database. Uploaded files are validated as images and never executed. User data is scoped with parameterized queries; no private records are accessed before authentication. User-supplied HTML is not rendered. Do not commit `.streamlit/secrets.toml`, database files or keys. Do not serve the database directory as static content. Internet-facing deployments should additionally use an authenticated HTTPS gateway for every path, especially with multiple worker processes.
+New installs default to `~/.local/share/hibid-smart-deal-hunter/dealhunter.sqlite3`, outside the source checkout, with owner-only file permissions. Existing checkout-local `data/dealhunter.sqlite3` history is reused when no override is configured; it is never silently moved or replaced. `DEAL_HUNTER_DB` overrides this with a real writable database file path (not just a directory). Invalid or inaccessible configured paths stop the private dashboard with a configuration message rather than silently creating another database.
+
+On **Streamlit Community Cloud**, open **Manage app → Settings → Secrets** and omit `DEAL_HUNTER_DB` to use user storage. If you copied the old example `/private/persistent/dealhunter.sqlite3`, remove that line: the example did not create a volume and can cause `PermissionError`. Save the secrets and reboot the app if necessary. If that path previously contained records on another deployment, preserve/export them before changing it. Community Cloud local files are ephemeral and may disappear on reboot/redeployment; the writable default fixes startup, not durable hosting. For durable hosted history, use a host with an actual private persistent volume and configure its database file path. Never point private storage at a publicly served directory.
+
+Back up the database consistently (SQLite backup API or stop the app before copying). The database is not encrypted at rest: host filesystem access is an administrator privilege. There is no HiBid account/password field and no credential database. Uploaded files are validated as images and never executed. User data is scoped with parameterized queries; no private records are accessed before authentication. User-supplied HTML is not rendered. Do not commit `.streamlit/secrets.toml`, database files or keys. Internet-facing deployments should additionally use an authenticated HTTPS gateway for every path, especially with multiple worker processes.
 
 ## Tests
 

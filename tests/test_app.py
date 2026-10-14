@@ -1,5 +1,6 @@
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -167,3 +168,19 @@ def test_multiple_sources_choose_lowest_delivered_and_persist_provenance(configu
     assert record['selected_price_source']['retailer'] == 'First store'
     assert record['calculation']['retail_total'] == '113.000'
     assert not at.exception
+
+
+@pytest.mark.parametrize('failure', [PermissionError('private details'), OSError('private details'), sqlite3.OperationalError('private details')])
+def test_storage_failure_is_actionable_and_does_not_open_another_database(configured, monkeypatch, failure):
+    attempts = []
+    def unavailable(path):
+        attempts.append(path)
+        raise failure
+    monkeypatch.setattr('dealhunter.storage.Store', unavailable)
+    at = login()
+    assert not at.exception
+    assert not at.number_input
+    assert len(attempts) == 1
+    assert not configured.exists()
+    assert 'Manage app' in at.error[0].value and 'DEAL_HUNTER_DB' in at.error[0].value
+    assert 'private details' not in at.error[0].value

@@ -101,3 +101,53 @@ def test_login_throttle_is_shared_between_sessions():
     assert all(limiter.allow('alice') for _ in range(5))
     assert not limiter.allow('alice')
     assert limiter.allow('bob')
+
+
+def test_default_storage_uses_user_directory_not_checkout(tmp_path, monkeypatch):
+    from pathlib import Path
+    from dealhunter.storage import database_path
+    user_directory = tmp_path / 'user'
+    checkout = tmp_path / 'read-only-checkout'
+    monkeypatch.setattr(Path, 'home', lambda: user_directory)
+    path = database_path(legacy_directory=checkout)
+    assert path == user_directory / '.local/share/hibid-smart-deal-hunter/dealhunter.sqlite3'
+    store = Store(path)
+    store.save_watchlist('alice', 'saved', {'models': ['ABC']})
+    assert Store(database_path(legacy_directory=checkout)).watchlists('alice')[0]['models'] == ['ABC']
+    assert not checkout.exists()
+
+
+def test_existing_legacy_history_is_preserved(tmp_path):
+    from dealhunter.storage import database_path
+    legacy = tmp_path / 'data/dealhunter.sqlite3'
+    Store(legacy).save_watchlist('alice', 'history', {'keywords': ['saved']})
+    assert database_path(legacy_directory=tmp_path) == legacy
+    assert Store(database_path(legacy_directory=tmp_path)).watchlists('alice')[0]['keywords'] == ['saved']
+
+
+def test_explicit_path_is_never_silently_replaced(tmp_path):
+    from dealhunter.storage import database_path
+    blocker = tmp_path / 'not-a-directory'
+    blocker.write_text('existing file')
+    path = database_path(str(blocker / 'db.sqlite3'), tmp_path)
+    assert path == blocker / 'db.sqlite3'
+    with pytest.raises(OSError):
+        Store(path)
+    assert blocker.read_text() == 'existing file'
+    for value in ('', '   ', 123):
+        with pytest.raises(ValueError):
+            database_path(value, tmp_path)
+
+
+def test_inaccessible_legacy_history_does_not_trigger_fallback(tmp_path, monkeypatch):
+    from pathlib import Path
+    from dealhunter.storage import database_path
+    legacy = tmp_path / 'data/dealhunter.sqlite3'
+    original_stat = Path.stat
+    def denied(path, *args, **kwargs):
+        if path == legacy:
+            raise PermissionError('cannot inspect existing history')
+        return original_stat(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'stat', denied)
+    with pytest.raises(PermissionError):
+        database_path(legacy_directory=tmp_path)

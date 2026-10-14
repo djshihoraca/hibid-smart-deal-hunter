@@ -11,6 +11,23 @@ def utcnow():
     return datetime.now(timezone.utc).isoformat()
 
 
+def database_path(configured=None, legacy_directory=None):
+    """Respect custom storage and existing history; new installs use user storage."""
+    if configured is not None:
+        if not isinstance(configured, str) or not configured.strip():
+            raise ValueError("DEAL_HUNTER_DB must be a nonempty filesystem path")
+        return Path(configured).expanduser()
+    if legacy_directory is not None:
+        legacy = Path(legacy_directory) / "data" / "dealhunter.sqlite3"
+        try:
+            legacy.stat()
+        except FileNotFoundError:
+            pass
+        else:
+            return legacy
+    return Path.home() / ".local" / "share" / "hibid-smart-deal-hunter" / "dealhunter.sqlite3"
+
+
 class Store:
     def __init__(self, path):
         self.path = Path(path)
