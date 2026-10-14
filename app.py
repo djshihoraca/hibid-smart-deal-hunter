@@ -4,7 +4,9 @@ import base64
 import json
 import os
 import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
@@ -100,6 +102,10 @@ def fingerprint(value):
 
 def money(value):
     return f'${value:.2f}'
+
+
+def display_time(value):
+    return datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone(ZoneInfo('America/Toronto')).strftime('%Y-%m-%d %H:%M %Z')
 
 
 def show_photos(photos):
@@ -244,7 +250,7 @@ with inspect_tab:
             st.warning('Retail observation expired after 15 minutes. Verify it again.')
             source = {}
         if source:
-            st.success(f"Live verified: {source['retailer']} — {money(source['price'])} CAD. Observed {source['observed_at']}")
+            st.success(f"Live verified: {source['retailer']} — {money(source['price'])} CAD. Observed {display_time(source['observed_at'])}")
         retail, retail_delivery = source.get('price', 0), source.get('delivery', 0)
 
     # Compare multiple exact-match sources within this listing inspection.
@@ -297,8 +303,8 @@ with inspect_tab:
     x.metric('Retail delivered total', money(calculation['retail_total']))
     y.metric('Maximum hammer bid', money(calculation['max_hammer']))
     z.metric('Savings at proposed bid', f"{calculation['savings_percent']:.1f}%")
-    st.caption(f"Auction all-in: {money(calculation['current_total'])}. Target budget: {money(calculation['budget'])}. "
-               "Ceiling is floored to increment multiples; check the auction's actual bid ladder.")
+    st.caption((f"Auction all-in: {money(calculation['current_total'])}. Target budget: {money(calculation['budget'])}. "
+                "Ceiling is floored to increment multiples; check the auction's actual bid ladder.").replace('$', r'\$'))
     watch_match = (not categories or category in categories) and (not lines(brands) or brand.casefold() in {b.casefold() for b in lines(brands)})
     watch_match = watch_match and (not lines(models) or name.casefold() in {m.casefold() for m in lines(models)})
     watch_match = watch_match and (not lines(keywords) or any(k.casefold() in (name + ' ' + description).casefold() for k in lines(keywords)))
@@ -327,9 +333,10 @@ with inspect_tab:
         else:
             st.error('Enter an exact item name / model before saving.')
     if calculation['above_ceiling'] and calculation['affordable']:
-        st.warning('An exception does not satisfy the discount rule and never submits a bid.')
+        st.warning('An exception requires manual review and never submits a bid.')
         reason = st.text_area('Reason for exceeding this bid ceiling')
-        approval = st.checkbox(f"I explicitly approve this {money(current)} hammer bid above the {money(calculation['max_hammer'])} ceiling", key='approval:' + fingerprint(record))
+        approval_label = f"I explicitly approve this {money(current)} hammer bid above the {money(calculation['max_hammer'])} ceiling"
+        approval = st.checkbox(approval_label.replace('$', r'\$'), key='approval:' + fingerprint(record))
         if st.button('Approve this exception and save inspection', disabled=not (approval and reason.strip() and name.strip()), use_container_width=True):
             record['decision'] = decide(calculation, assessment, source, complete=complete,
                                          accepted_conditions=accepted, claimed_conditions=condition, approved=True)
@@ -354,7 +361,7 @@ with history_tab:
         by_id = {entry['id']: entry for entry in history}
         chosen = st.selectbox('Saved inspection', list(by_id), format_func=lambda i: f"#{i} · {by_id[i]['name']} · {by_id[i]['decision']['status']}")
         entry = by_id[chosen]
-        with st.expander(f"#{entry['id']} · {entry['name']} · {entry['decision']['status']} · {entry['created_at']}"):
+        with st.expander(f"#{entry['id']} · {entry['name']} · {entry['decision']['status']} · {display_time(entry['created_at'])}"):
             st.json(entry)
             saved_photos = store.photos(owner, entry['id'])
             if saved_photos:
