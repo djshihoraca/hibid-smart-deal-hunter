@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 import streamlit as st
 
 from dealhunter.calculator import calculate
+from dealhunter.catalogue import amount, catalogue_entries, percentage
 from dealhunter.inspection import CATEGORIES, CONDITIONS, assess, decide
 from dealhunter.integrations import https_url, live_retail, source_fresh, validate_photo, vision_photos
 from dealhunter.security import LoginLimiter, verify_password
@@ -193,11 +194,11 @@ with st.sidebar:
     discount = st.slider('Required savings (%)', 70, 95, 70)
     st.info('Search HiBid manually. Watchlists store preferences; they do not monitor auctions.')
 
-inspect_tab, history_tab = st.tabs(['Inspect listing', 'Inspection history'])
+catalogue_tab, inspect_tab, history_tab = st.tabs(['Catalogue', 'Inspect listing', 'Inspection history'])
 with inspect_tab:
     st.header('Inspect an auction listing')
     url = st.text_input('HiBid listing URL')
-    name = st.text_input('Exact item name / model')
+    name = st.text_input('Exact item name / model', help='Required only when inspecting a specific listing and comparing its retail value. Catalogue browsing does not require a model number.')
     category = st.selectbox('Listing category', CATEGORIES)
     brand = st.text_input('Listing brand')
     condition = st.multiselect('Claimed conditions', CONDITIONS)
@@ -390,6 +391,67 @@ with inspect_tab:
     download_record(record, 'hibid_inspection.json')
     if https_url(url):
         st.link_button('Open listing to review / bid manually', url, use_container_width=True)
+
+with catalogue_tab:
+    st.header('Listing catalogue')
+    st.caption('Your saved auction inspections — not live auction search results. Prices, availability and condition may have changed since inspection.')
+    query = st.text_input('Search catalogue (optional)', help='Browse everything or enter a brand, category, model or keyword. No specific item is required.')
+    filter_category = st.selectbox('Catalogue category', ['All categories'] + CATEGORIES)
+    filter_status = st.selectbox('Catalogue decision', ['All decisions', 'eligible', 'requiring review', 'rejected'])
+    catalogue = catalogue_entries(store.history(owner), query, filter_category, filter_status)
+    st.caption(f'{len(catalogue)} matching listings from the latest 200 inspection snapshots. Only the latest saved inspection per listing URL is shown.')
+    if not catalogue:
+        st.info('No saved listings match yet. Add a listing in Inspect listing, review it, then click Save inspection. Current auction results require an authorized auction API or feed; none is connected.')
+    else:
+        per_page = 10
+        pages = (len(catalogue) + per_page - 1) // per_page
+        page_number = st.selectbox('Catalogue page', list(range(1, pages + 1)))
+        page_entries = catalogue[(page_number - 1) * per_page:page_number * per_page]
+        for row in range(0, len(page_entries), 2):
+            columns = st.columns(2)
+            for column, entry in zip(columns, page_entries[row:row + 2]):
+                with column:
+                    with st.container(border=True):
+                        st.subheader(entry.get('name', 'Unnamed listing'))
+                        st.caption(f"{entry.get('category', 'Category not recorded')} · {entry.get('brand') or 'Brand not recorded'}")
+                        st.caption(f"Saved {display_time(entry['created_at'])} · Manually entered auction information")
+                        saved_photos = store.photos(owner, entry['id'])
+                        if saved_photos:
+                            show_photos(saved_photos[:1])
+                        else:
+                            st.caption('No listing photo saved.')
+                        st.write('Claimed condition: ' + (', '.join(entry.get('conditions', [])) or 'Not recorded'))
+                        decision = entry.get('decision', {})
+                        getattr(st, {'eligible': 'success', 'rejected': 'error'}.get(decision.get('status'), 'warning'))(
+                            'Decision: ' + decision.get('status', 'requiring review').capitalize())
+                        calculation = entry.get('calculation', {})
+                        st.text('Proposed hammer bid: ' + amount(entry.get('bid_inputs', {}).get('current')))
+                        st.text('Auction all-in estimate: ' + amount(calculation.get('current_total')))
+                        st.text('Maximum hammer bid: ' + amount(calculation.get('max_hammer')))
+                        st.text('Retail delivered comparison: ' + amount(calculation.get('retail_total')))
+                        st.text('Savings at proposed bid: ' + percentage(calculation.get('savings_percent')))
+                        source = entry.get('selected_price_source') or next(iter(entry.get('price_sources', [])), {})
+                        st.caption('Retail evidence: ' + {'live_verified': 'Live verified at inspection time; not refreshed now',
+                                                         'manual_verified': 'Manually verified at inspection time',
+                                                         'manual_unverified': 'Manual price — unverified'}.get(source.get('kind'), 'Not recorded'))
+                        if source.get('retailer'):
+                            st.text('Retailer: ' + source['retailer'])
+                        with st.expander('All listing details and inspection findings'):
+                            st.text(entry.get('description') or 'No description recorded.')
+                            for flag in entry.get('assessment', {}).get('flags', []):
+                                st.write('• ' + flag)
+                            st.text('Photo notes: ' + (entry.get('assessment', {}).get('observations', {}).get('notes') or 'Not recorded'))
+                            st.warning('Photos are never proof of functionality. Saved eligibility is not a current auction or bidding guarantee.')
+                            for reason in decision.get('reasons', []):
+                                st.write('• ' + reason)
+                            if decision.get('approved'):
+                                st.warning('An explicit ceiling exception was recorded for this saved inspection only.')
+                            st.json(entry)
+                            download_record(entry, f"inspection_{entry['id']}.json")
+                        if https_url(entry.get('listing_url', '')):
+                            st.link_button('Review current auction listing manually', entry['listing_url'], use_container_width=True)
+                        if https_url(source.get('url', '')):
+                            st.link_button('Open retail comparison', source['url'], use_container_width=True)
 
 with history_tab:
     st.header('Private inspection history')

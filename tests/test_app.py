@@ -215,3 +215,25 @@ def test_temporary_recovery_requires_explicit_consent_and_keeps_original_path(co
     assert not configured.exists()
     widget(at, 'button', 'Sign out').click().run()
     assert 'temporary_storage' not in at.session_state
+
+
+def test_catalogue_updates_after_save_and_supports_browsing_without_specific_item(configured):
+    at = login()
+    assert at.tabs[0].label == 'Catalogue'
+    assert widget(at, 'text_input', 'Search catalogue (optional)').value == ''
+    widget(at, 'text_input', 'HiBid listing URL').set_value('https://hibid.com/lot/catalogue')
+    widget(at, 'text_input', 'Exact item name / model').set_value('Catalogue drill')
+    widget(at, 'text_input', 'Listing brand').set_value('Makita')
+    widget(at, 'selectbox', 'Listing category').set_value('Power Tools')
+    widget(at, 'text_area', 'Full seller description').set_value('Includes battery and charger')
+    widget(at, 'button', 'Save inspection').click().run()
+    assert not at.exception
+    assert any(h.value == 'Catalogue drill' for h in at.subheader)
+    assert any('Maximum hammer bid: CAD $26.00' in t.value for t in at.text)
+    assert any('not live auction search' in c.value for c in at.caption)
+    widget(at, 'text_input', 'Search catalogue (optional)').set_value('MAKITA battery').run()
+    assert any(h.value == 'Catalogue drill' for h in at.subheader)
+    widget(at, 'selectbox', 'Catalogue category').set_value('Electronics').run()
+    assert not any(h.value == 'Catalogue drill' for h in at.subheader)
+    other_user = login('bob')
+    assert not any(h.value == 'Catalogue drill' for h in other_user.subheader)
