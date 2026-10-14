@@ -15,7 +15,7 @@ from dealhunter.calculator import calculate
 from dealhunter.inspection import CATEGORIES, CONDITIONS, assess, decide
 from dealhunter.integrations import https_url, live_retail, source_fresh, validate_photo, vision_photos
 from dealhunter.security import LoginLimiter, verify_password
-from dealhunter.storage import Store, database_path, utcnow
+from dealhunter.storage import Store, database_path, storage_reason, temporary_database_path, utcnow
 
 st.set_page_config(page_title='HiBid Smart Deal Hunter', page_icon='🔎', layout='wide')
 st.markdown('''<style>
@@ -90,15 +90,46 @@ def authenticate():
 
 
 owner = authenticate()  # No database or private dashboard before authentication.
+storage_source = 'automatic storage discovery'
+storage_stage = 'resolve-path'
 try:
-    store = Store(database_path(setting('DEAL_HUNTER_DB', None), Path(__file__).parent))
-except (OSError, sqlite3.Error, ValueError):
-    st.error('Private storage could not be opened. In Streamlit Cloud, open Manage app → Settings → Secrets '
-             'and remove DEAL_HUNTER_DB to use the default user storage, or set it to a real writable '
-             'database file path. The example /private/persistent path is not a provisioned volume. '
-             'If using an existing database, check its directory permissions and availability; do not '
-             'change paths without preserving your history. No alternate database has been opened.')
+    if st.session_state.get('temporary_storage'):
+        selected_database = Path(st.session_state.temporary_storage)
+        storage_source = 'explicit temporary session storage'
+    else:
+        configured_database = setting('DEAL_HUNTER_DB', None)
+        if os.environ.get('DEAL_HUNTER_DB') is not None:
+            storage_source = 'environment variable DEAL_HUNTER_DB (takes priority over Secrets)'
+        elif configured_database is not None:
+            storage_source = 'Streamlit Secrets DEAL_HUNTER_DB'
+        selected_database = database_path(configured_database, Path(__file__).parent)
+        if configured_database is None:
+            storage_source = ('existing checkout history' if selected_database == Path(__file__).parent / 'data' / 'dealhunter.sqlite3'
+                              else 'default user storage directory')
+    storage_stage = 'open-storage'
+    store = Store(selected_database)
+except (OSError, sqlite3.Error, ValueError) as exc:
+    st.error('Private storage could not be opened. No alternate database has been opened.')
+    st.code(f"Storage source: {storage_source}\nDiagnostic: {getattr(exc, 'stage', storage_stage)} / {storage_reason(exc)}", language=None)
+    st.write('In Streamlit Cloud, open Manage app → Settings → Secrets. Remove DEAL_HUNTER_DB entirely '
+             '(do not leave an empty string), or set it to an actual writable database file path. '
+             'An environment variable overrides Secrets. For existing history, check directory ownership '
+             'and permissions before changing paths. The old /private/persistent example is not a provisioned volume.')
+    st.warning('Optional recovery: a separate temporary database can let you inspect listings now. '
+               'It will not contain existing history and is not durable. Export records before signing out; '
+               'they may be lost after logout, reboot or redeployment. The original database will not be modified.')
+    temporary_ack = st.checkbox('I understand temporary storage is separate and may lose records')
+    if st.button('Use temporary storage for this session', disabled=not temporary_ack):
+        try:
+            st.session_state.temporary_storage = str(temporary_database_path())
+        except OSError:
+            st.error('Temporary storage is also unavailable. Ask the hosting administrator for a writable private directory.')
+        else:
+            st.rerun()
     st.stop()
+if st.session_state.get('temporary_storage'):
+    st.warning('Temporary session storage is active. Existing history is not shown. Export records before signing out; '
+               'this storage is not durable across logout, reboot or redeployment.')
 
 
 def lines(value):

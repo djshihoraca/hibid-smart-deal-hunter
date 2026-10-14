@@ -151,3 +151,41 @@ def test_inaccessible_legacy_history_does_not_trigger_fallback(tmp_path, monkeyp
     monkeypatch.setattr(Path, 'stat', denied)
     with pytest.raises(PermissionError):
         database_path(legacy_directory=tmp_path)
+
+
+def test_storage_diagnostics_classify_failure_without_exposing_paths(tmp_path):
+    import errno
+    import sqlite3
+    from dealhunter.storage import StorageError, storage_reason
+    assert storage_reason(PermissionError('/private/secret-path')) == 'permission-denied'
+    assert storage_reason(OSError(errno.EROFS, 'private mount')) == 'filesystem-read-only'
+    assert storage_reason(OSError(errno.ENOSPC, 'private mount')) == 'storage-full'
+    assert storage_reason(ValueError('configured path')) == 'invalid-path'
+    for code, reason in [(sqlite3.SQLITE_READONLY, 'database-read-only'),
+                         (sqlite3.SQLITE_BUSY, 'database-locked'),
+                         (sqlite3.SQLITE_NOTADB, 'database-invalid')]:
+        error = sqlite3.OperationalError('secret details')
+        error.sqlite_errorcode = code
+        assert storage_reason(error) == reason
+    blocker = tmp_path / 'file'
+    blocker.write_text('private contents')
+    with pytest.raises(StorageError) as failure:
+        Store(blocker / 'db')
+    assert failure.value.stage == 'create-directory'
+    assert failure.value.reason == 'invalid-path'
+    assert 'private contents' not in str(failure.value)
+    assert str(tmp_path) not in str(failure.value)
+
+
+def test_temporary_database_uses_distinct_private_directories(tmp_path, monkeypatch):
+    import tempfile
+    from dealhunter.storage import temporary_database_path
+    monkeypatch.setattr(tempfile, 'tempdir', str(tmp_path))
+    first = temporary_database_path()
+    second = temporary_database_path()
+    assert first != second
+    assert first.parent.stat().st_mode & 0o777 == 0o700
+    assert second.parent.stat().st_mode & 0o777 == 0o700
+    store = Store(first)
+    store.save_watchlist('alice', 'temporary', {'keywords': ['temporary']})
+    assert Store(second).watchlists('alice') == []
