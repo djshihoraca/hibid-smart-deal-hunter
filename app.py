@@ -12,6 +12,9 @@ from zoneinfo import ZoneInfo
 import streamlit as st
 
 from dealhunter.calculator import calculate
+from dealhunter.catalogue import amount, catalogue_entries, percentage
+from dealhunter.live_catalogue import render_live_catalogue, render_saved_auction_snapshots, show_public_photos
+from dealhunter.reefapi import image_urls, numeric, review_imported_bid
 from dealhunter.inspection import CATEGORIES, CONDITIONS, assess, decide
 from dealhunter.integrations import https_url, live_retail, source_fresh, validate_photo, vision_photos
 from dealhunter.security import LoginLimiter, verify_password
@@ -168,6 +171,24 @@ def download_record(record, filename):
     st.markdown(f'<a download="{filename}" href="data:application/json;base64,{payload}">Download inspection report (JSON)</a>', unsafe_allow_html=True)
 
 
+pending = st.session_state.pop('reef_pending_inspection', None)
+if pending:
+    imported = pending['lot']
+    st.session_state.reef_import = pending
+    st.session_state.listing_url = imported['url']
+    st.session_state.listing_name = imported['title']
+    st.session_state.listing_description = imported.get('description', '')
+    st.session_state.listing_conditions = []
+    next_bid = numeric(imported.get('next_bid_amount'))
+    if next_bid is None:
+        next_bid = numeric(imported.get('current_bid'))
+    st.session_state.proposed_hammer = float(next_bid) if next_bid is not None and next_bid <= 1_000_000_000 else 0.0
+    st.session_state.terms_confirmed = False
+    st.session_state.uncertainty_confirmed = False
+    for stale in ('vision', 'retail', 'manual_check', 'comparison_scope', 'price_sources'):
+        st.session_state.pop(stale, None)
+
+
 watchlists = store.watchlists(owner)
 with st.sidebar:
     st.header('Watchlists')
@@ -191,18 +212,28 @@ with st.sidebar:
         else:
             st.error('Enter a name and at least one acceptable condition.')
     discount = st.slider('Required savings (%)', 70, 95, 70)
-    st.info('Search HiBid manually. Watchlists store preferences; they do not monitor auctions.')
+    st.info('Browse live lots through the ReefAPI catalogue, or add listings manually. Watchlists do not submit bids or monitor auctions in the background.')
 
-inspect_tab, history_tab = st.tabs(['Inspect listing', 'Inspection history'])
+catalogue_tab, inspect_tab, history_tab, agents_tab = st.tabs(['Catalogue', 'Inspect listing', 'Inspection history', 'Agent team'])
 with inspect_tab:
     st.header('Inspect an auction listing')
-    url = st.text_input('HiBid listing URL')
-    name = st.text_input('Exact item name / model')
+    url = st.text_input('HiBid listing URL', key='listing_url')
+    name = st.text_input('Exact item name / model', key='listing_name', help='Required only for exact retail comparison, not catalogue search. Imported seller titles are not verified model numbers; confirm the exact model.')
     category = st.selectbox('Listing category', CATEGORIES)
     brand = st.text_input('Listing brand')
-    condition = st.multiselect('Claimed conditions', CONDITIONS)
-    description = st.text_area('Full seller description', height=160)
-    uploads = st.file_uploader('Listing photos (up to 5, 10 MB each)', type=['png', 'jpg', 'jpeg', 'webp'], accept_multiple_files=True)
+    condition = st.multiselect('Claimed conditions', CONDITIONS, key='listing_conditions')
+    description = st.text_area('Full seller description', height=160, key='listing_description')
+    source_snapshot = st.session_state.get('reef_import')
+    if source_snapshot and source_snapshot['lot']['url'] != url:
+        source_snapshot = None
+    imported_images = image_urls(source_snapshot['lot']) if source_snapshot else []
+    if source_snapshot:
+        st.info(f"Imported through ReefAPI at {display_time(source_snapshot['fetched_at'])}. Confirm the exact model and condition; enter actual buyer premium, taxes, shipping and fees from the sale terms. Imported titles are not retail verification.")
+        show_public_photos(source_snapshot['lot'], all_photos=True)
+        with st.expander('Imported auction terms and current-bid snapshot'):
+            st.json(source_snapshot['lot'])
+    upload_scope = fingerprint(source_snapshot) if source_snapshot else 'manual'
+    uploads = st.file_uploader('Listing photos (up to 5, 10 MB each)', type=['png', 'jpg', 'jpeg', 'webp'], accept_multiple_files=True, key='uploads:' + upload_scope)
     photos = []
     if len(uploads or []) > 5:
         st.error('Upload at most five photos.')
@@ -218,7 +249,7 @@ with inspect_tab:
     if photos:
         show_photos(photos)
     st.warning('Photos may show visible concerns. They never prove functionality, authenticity, or absence of hidden defects.')
-    vision_key = fingerprint({'description': description, 'conditions': condition,
+    vision_key = fingerprint({'description': description, 'conditions': condition, 'auction_source': source_snapshot,
                               'photos': [(n, hashlib.sha256(b).hexdigest()) for n, b in photos]})
     with st.expander('Photo inspection', expanded=True):
         reviewed = st.checkbox('I reviewed the uploaded photos manually', key='reviewed:' + vision_key)
@@ -238,11 +269,13 @@ with inspect_tab:
                     st.error('Photo analysis failed. No AI assessment is available; continue manual inspection.')
         else:
             st.caption('Optional AI photo analysis needs VISION_API_KEY. Manual observations are stored as manual assessments.')
+        if imported_images:
+            st.caption('Imported public photos support manual review. Upload photo files above to include them in AI analysis and preserve their bytes in history.')
     vision_state = st.session_state.get('vision', {})
     vision = vision_state.get('result') if vision_state.get('key') == vision_key else None
-    observations = {'reviewed': bool(reviewed and photos), 'damage': damage, 'missing': missing,
+    observations = {'reviewed': bool(reviewed and (photos or imported_images)), 'damage': damage, 'missing': missing,
                     'inconsistent': inconsistent, 'notes': notes}
-    assessment = assess(description, condition, len(photos), observations, vision)
+    assessment = assess(description, condition, len(photos) + len(imported_images), observations, vision)
     for flag in assessment['flags']:
         st.caption('• ' + flag)
 
@@ -330,10 +363,10 @@ with inspect_tab:
     with b:
         fees = st.number_input('Other mandatory fees (CAD, before tax if taxable)', min_value=0.0, value=0.0)
         fees_taxable = st.checkbox('Other mandatory fees are taxable', value=True)
-        current = st.number_input('Proposed hammer bid (CAD)', min_value=0.0, value=0.0)
+        current = st.number_input('Proposed hammer bid (CAD)', min_value=0.0, value=0.0, key='proposed_hammer')
         increment = st.number_input('Bid increment (CAD)', min_value=0.01, value=1.0)
-    terms = st.checkbox('I checked seller terms, tax treatment, pickup radius, exact model and equivalent condition')
-    functionality = st.checkbox('I accept the documented uncertainty; photos do not establish functionality')
+    terms = st.checkbox('I checked seller terms, tax treatment, pickup radius, exact model and equivalent condition', key='terms_confirmed')
+    functionality = st.checkbox('I accept the documented uncertainty; photos do not establish functionality', key='uncertainty_confirmed')
     inputs = dict(retail=retail, retail_tax=retail_tax, retail_delivery=retail_delivery,
                   premium=premium, auction_tax=auction_tax, premium_taxable=premium_taxable,
                   shipping=shipping, shipping_taxable=shipping_taxable, fees=fees,
@@ -350,10 +383,11 @@ with inspect_tab:
     watch_match = watch_match and (not lines(keywords) or any(k.casefold() in (name + ' ' + description).casefold() for k in lines(keywords)))
     if not watch_match:
         st.warning("Listing does not match the active watchlist's category, brand, model or keyword preferences.")
-    complete = bool(https_url(url) and name.strip() and description.strip() and condition and photos
+    complete = bool(https_url(url) and name.strip() and description.strip() and condition and (photos or imported_images)
                     and terms and functionality and source.get('condition') in condition and watch_match)
     decision = decide(calculation, assessment, source, complete=complete,
                       accepted_conditions=accepted, claimed_conditions=condition)
+    decision = review_imported_bid(decision, source_snapshot, current)
     getattr(st, {'eligible': 'success', 'requiring review': 'warning', 'rejected': 'error'}[decision['status']])(
         'Decision: ' + decision['status'].capitalize())
     for reason_text in decision['reasons']:
@@ -365,7 +399,8 @@ with inspect_tab:
               'bid_inputs': inputs, 'calculation': {k: str(v) if not isinstance(v, bool) else v for k, v in calculation.items()},
               'checklist': {'terms': terms, 'uncertainty_accepted': functionality, 'complete': complete},
               'decision': decision, 'photo_filenames': [n for n, _ in photos],
-              'photo_sha256': [hashlib.sha256(raw).hexdigest() for _, raw in photos]}
+              'photo_sha256': [hashlib.sha256(raw).hexdigest() for _, raw in photos],
+              'auction_source': source_snapshot}
     if st.button('Save inspection', use_container_width=True):
         if name.strip():
             record_id = store.save_inspection(owner, record, photos)
@@ -380,6 +415,7 @@ with inspect_tab:
         if st.button('Approve this exception and save inspection', disabled=not (approval and reason.strip() and name.strip()), use_container_width=True):
             record['decision'] = decide(calculation, assessment, source, complete=complete,
                                          accepted_conditions=accepted, claimed_conditions=condition, approved=True)
+            record['decision'] = review_imported_bid(record['decision'], source_snapshot, current)
             if not record['decision']['approved']:
                 st.error('This listing cannot receive a ceiling exception under the active condition preferences.')
             else:
@@ -390,6 +426,76 @@ with inspect_tab:
     download_record(record, 'hibid_inspection.json')
     if https_url(url):
         st.link_button('Open listing to review / bid manually', url, use_container_width=True)
+
+with catalogue_tab:
+    st.header('Listing catalogue')
+    reef_key = setting('REEFAPI_KEY')
+    source_choice = st.radio('Catalogue source', ['Live HiBid listings', 'Saved inspections', 'Saved auction snapshots'], index=0 if reef_key else 1)
+    if source_choice == 'Live HiBid listings':
+        render_live_catalogue(reef_key, store, owner, postal, radius, display_time)
+    elif source_choice == 'Saved auction snapshots':
+        render_saved_auction_snapshots(store, owner, display_time)
+    else:
+        st.caption('Your saved auction inspections — not live auction search results. Prices, availability and condition may have changed since inspection.')
+        query = st.text_input('Search catalogue (optional)', help='Browse everything or enter a brand, category, model or keyword. No specific item is required.')
+        filter_category = st.selectbox('Catalogue category', ['All categories'] + CATEGORIES)
+        filter_status = st.selectbox('Catalogue decision', ['All decisions', 'eligible', 'requiring review', 'rejected'])
+        catalogue = catalogue_entries(store.history(owner), query, filter_category, filter_status)
+        st.caption(f'{len(catalogue)} matching listings from the latest 200 inspection snapshots. Only the latest saved inspection per listing URL is shown.')
+        if not catalogue:
+            st.info('No saved listings match yet. Add a listing in Inspect listing, review it, then click Save inspection. Choose Live HiBid listings to connect ReefAPI.')
+        else:
+            per_page = 10
+            pages = (len(catalogue) + per_page - 1) // per_page
+            page_number = st.selectbox('Catalogue page', list(range(1, pages + 1)))
+            page_entries = catalogue[(page_number - 1) * per_page:page_number * per_page]
+            for row in range(0, len(page_entries), 2):
+                columns = st.columns(2)
+                for column, entry in zip(columns, page_entries[row:row + 2]):
+                    with column:
+                        with st.container(border=True):
+                            st.subheader(entry.get('name', 'Unnamed listing'))
+                            st.caption(f"{entry.get('category', 'Category not recorded')} · {entry.get('brand') or 'Brand not recorded'}")
+                            st.caption(f"Saved {display_time(entry['created_at'])} · " + ('ReefAPI auction snapshot, not refreshed now' if entry.get('auction_source') else 'Manually entered auction information'))
+                            saved_photos = store.photos(owner, entry['id'])
+                            if saved_photos:
+                                show_photos(saved_photos[:1])
+                            elif entry.get('auction_source'):
+                                show_public_photos(entry['auction_source']['lot'])
+                            else:
+                                st.caption('No listing photo saved.')
+                            st.write('Claimed condition: ' + (', '.join(entry.get('conditions', [])) or 'Not recorded'))
+                            decision = entry.get('decision', {})
+                            getattr(st, {'eligible': 'success', 'rejected': 'error'}.get(decision.get('status'), 'warning'))(
+                                'Decision: ' + decision.get('status', 'requiring review').capitalize())
+                            calculation = entry.get('calculation', {})
+                            st.text('Proposed hammer bid: ' + amount(entry.get('bid_inputs', {}).get('current')))
+                            st.text('Auction all-in estimate: ' + amount(calculation.get('current_total')))
+                            st.text('Maximum hammer bid: ' + amount(calculation.get('max_hammer')))
+                            st.text('Retail delivered comparison: ' + amount(calculation.get('retail_total')))
+                            st.text('Savings at proposed bid: ' + percentage(calculation.get('savings_percent')))
+                            source = entry.get('selected_price_source') or next(iter(entry.get('price_sources', [])), {})
+                            st.caption('Retail evidence: ' + {'live_verified': 'Live verified at inspection time; not refreshed now',
+                                                             'manual_verified': 'Manually verified at inspection time',
+                                                             'manual_unverified': 'Manual price — unverified'}.get(source.get('kind'), 'Not recorded'))
+                            if source.get('retailer'):
+                                st.text('Retailer: ' + source['retailer'])
+                            with st.expander('All listing details and inspection findings'):
+                                st.text(entry.get('description') or 'No description recorded.')
+                                for flag in entry.get('assessment', {}).get('flags', []):
+                                    st.write('• ' + flag)
+                                st.text('Photo notes: ' + (entry.get('assessment', {}).get('observations', {}).get('notes') or 'Not recorded'))
+                                st.warning('Photos are never proof of functionality. Saved eligibility is not a current auction or bidding guarantee.')
+                                for reason in decision.get('reasons', []):
+                                    st.write('• ' + reason)
+                                if decision.get('approved'):
+                                    st.warning('An explicit ceiling exception was recorded for this saved inspection only.')
+                                st.json(entry)
+                                download_record(entry, f"inspection_{entry['id']}.json")
+                            if https_url(entry.get('listing_url', '')):
+                                st.link_button('Review current auction listing manually', entry['listing_url'], use_container_width=True)
+                            if https_url(source.get('url', '')):
+                                st.link_button('Open retail comparison', source['url'], use_container_width=True)
 
 with history_tab:
     st.header('Private inspection history')
@@ -407,5 +513,9 @@ with history_tab:
             if saved_photos:
                 show_photos(saved_photos)
             download_record(entry, f"inspection_{entry['id']}.json")
+
+with agents_tab:
+    from dealhunter.operations import render_operations
+    render_operations(store, owner, setting('REEFAPI_KEY'))
 
 st.caption('Not affiliated with HiBid. No HiBid credentials are collected or stored. Eligibility is decision support, not authorization to bid.')
