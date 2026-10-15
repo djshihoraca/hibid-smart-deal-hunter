@@ -238,3 +238,37 @@ def test_catalogue_updates_after_save_and_supports_browsing_without_specific_ite
     assert not any(h.value == 'Catalogue drill' for h in at.subheader)
     other_user = login('bob')
     assert not any(h.value == 'Catalogue drill' for h in other_user.subheader)
+
+
+def test_agent_dashboard_runs_private_team_and_renders_both_drafts(configured):
+    from tests.test_agents import inspection, comparable
+    store=Store(configured)
+    record=inspection(); record.pop('id')
+    store.save_inspection('alice',record)
+    at=login()
+    assert 'Agent team' in [t.label for t in at.tabs]
+    widget(at,'checkbox','I included all expected additional resale costs').check()
+    widget(at,'button','Queue research and both marketplace drafts').click().run()
+    assert not at.exception
+    assert len(store.agent_jobs('alice'))==5
+    # Missing sales evidence blocks bid proposals while producing two private drafts.
+    for _ in range(5):
+        widget(at,'button','Run next queued agent').click().run()
+        assert not at.exception
+    actions=store.agent_actions('alice')
+    assert len(actions)==2 and {a['payload']['platform'] for a in actions}=={'Facebook Marketplace','Kijiji'}
+    assert all(a['status']=='proposed' for a in actions)
+    assert all(button.disabled for button in at.button if button.label.startswith('Submit through'))
+    assert store.agent_actions('bob')==[]
+
+
+def test_agent_scout_queues_numeric_categories(configured, monkeypatch):
+    monkeypatch.setenv('REEFAPI_KEY','offline-test-key')
+    store=Store(configured)
+    store.save_watchlist('alice','Tools',{'categories':['Tools'],'models':['ABC123'],'conditions':['Used']})
+    at=login()
+    widget(at,'text_input','Provider category IDs for scout (comma separated)').set_value('10,20')
+    widget(at,'button','Queue product scout').click().run()
+    assert not at.exception
+    job=store.claim_agent_job('alice')
+    assert job['agent']=='Scout' and job['payload']['category_ids']==[10,20]

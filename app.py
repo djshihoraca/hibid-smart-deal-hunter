@@ -214,7 +214,7 @@ with st.sidebar:
     discount = st.slider('Required savings (%)', 70, 95, 70)
     st.info('Browse live lots through the ReefAPI catalogue, or add listings manually. Watchlists do not submit bids or monitor auctions in the background.')
 
-catalogue_tab, inspect_tab, history_tab = st.tabs(['Catalogue', 'Inspect listing', 'Inspection history'])
+catalogue_tab, inspect_tab, history_tab, agents_tab = st.tabs(['Catalogue', 'Inspect listing', 'Inspection history', 'Agent team'])
 with inspect_tab:
     st.header('Inspect an auction listing')
     url = st.text_input('HiBid listing URL', key='listing_url')
@@ -513,5 +513,9 @@ with history_tab:
             if saved_photos:
                 show_photos(saved_photos)
             download_record(entry, f"inspection_{entry['id']}.json")
+
+with agents_tab:
+    from dealhunter.operations import render_operations
+    render_operations(store, owner, setting('REEFAPI_KEY'))
 
 st.caption('Not affiliated with HiBid. No HiBid credentials are collected or stored. Eligibility is decision support, not authorization to bid.')

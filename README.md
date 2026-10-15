@@ -1,6 +1,6 @@
 # HiBid Smart Deal Hunter
 
-A private Canadian auction catalogue and inspection dashboard with optional ReefAPI live listing search. It stores watchlists and inspection history, identifies condition concerns, compares retail evidence, and calculates a hammer-bid ceiling for **at least 70% all-in savings**. It never logs in to HiBid, runs a HiBid scraper, monitors listings in the background, or places bids. Auction data is retrieved through the configured third-party ReefAPI service only when you request it.
+A private Canadian auction catalogue and inspection dashboard with optional ReefAPI live listing search. It stores watchlists and inspection history, identifies condition concerns, compares retail evidence, and calculates a hammer-bid ceiling for **at least 70% all-in savings**. It never logs in to HiBid or runs a HiBid scraper. User-queued scout jobs retrieve auction data through ReefAPI. There is no live bid submission or marketplace publishing connector installed; approvals and ad drafts stay private proposals.
 
 ## Run locally
 
@@ -120,3 +120,51 @@ python -m pip check
 ```
 
 Tests exercise tax combinations and the 70% boundary, invalid inputs, impossible budgets, description conflicts, photo uncertainty, tenant isolation, persistence, password verification, login/logout, watchlist saving, manual verification resets, multiple retail comparisons, and snapshot-bound ceiling approvals. API tests mock provider responses and enforce source matching/freshness, safe redirects and photo response schemas. Streamlit AppTest runs the actual dashboard; uploaded image bytes are injected for the photo workflow. Live ReefAPI, paid photo analysis and retailer calls require credentials/network access and are not exercised by the offline suite. ReefAPI tests cover the documented request/envelope contract, header-only authentication, error handling, multicategory deduplication, detail identity, snapshot isolation and dashboard import guards. A separate headless mobile Chromium check at a 393-pixel viewport verified login, actual photo upload, approval gating/saving, stacked columns, no horizontal overflow, and no private media endpoint requests. Physical Android browser testing remains recommended before remote deployment. Audit timestamps are stored in UTC; dashboard timestamps display in America/Toronto.
+
+
+## Agent team and phone inbox
+
+The **Agent team** tab runs five specialist tool agents through persistent, owner-scoped jobs. These are explicit workflows with bounded tools, not unsupervised browser agents. Existing catalogue and inspection flows remain available.
+
+```mermaid
+flowchart TD
+    W[Saved watchlist] --> S[Scout: ReefAPI search]
+    S --> I[Description inspection and saved snapshot]
+    U[User-reviewed saved inspection] --> R[Market research: supplied comparables]
+    R --> B[Bid assistant: savings and conservative profit checks]
+    U --> F[Facebook Marketplace draft]
+    U --> K[Kijiji draft]
+    B --> A[Exact-action approval inbox]
+    F --> A
+    K --> A
+    A --> C[Permitted write connector required: disconnected]
+```
+
+1. Save a watchlist. Choose its real ReefAPI category IDs and queue a scout; saved category names alone are not sufficient. The scout searches up to three saved models, otherwise brands, otherwise keywords, and filters these groups against title/description. It caps radius at 50 km and reserves at most ten search attempts per user per Toronto day, including failed requests. This budget excludes manual Catalogue requests and is not an account-wide billing cap. Results are candidates requiring actual pickup-distance and acceptable-condition verification; they are not automatically eligible. Each candidate saves a snapshot and queues a description-only inspection. Photos are never functionality evidence.
+2. Save a full inspection and select it in Agent team. Upload comparable-sale evidence as a JSON array, set resale costs and a profit target, and queue the team. Run **Run next queued agent** for each task, or run the worker below. Market research depends on inspection; bid analysis depends on research. Both platform drafts depend on inspection. Results and actions are visible in the private phone inbox after refresh.
+3. The bid assistant requires an eligible saved decision and the existing 70% all-in calculation; rejected or review-required inspections stay blocked even if a ceiling exception was recorded. It also requires confirmed additional resale costs, and sufficient comparable evidence. Its conservative estimate uses the lower price quartile minus auction all-in and resale costs. The proposed bid is the exact saved hammer amount, not permission to keep bidding to an unspecified maximum. All assumptions, maximum all-in cost, inspection/evidence fingerprints and profit range accompany it.
+4. Review the exact bid or each platform's title, body, asking price and photo references. Record a reason and approval separately for each action. Bid approvals expire after ten minutes; ad approvals after 24 hours. Changed content needs a new approval; revocation is available. Ad publication approval requires received ownership and authorized saved photo assets. Drafts deliberately flag functionality/accessories for seller confirmation and never infer ownership or license auction photos automatically.
+
+**Capability limits:** ReefAPI's supplied HiBid documentation describes read endpoints, not bid submission. No permitted, tested HiBid bidding, personal Facebook Marketplace posting, personal Kijiji posting, or live local completed-sale research connector has been verified or installed. Meta's [official Business SDK](https://github.com/facebook/facebook-python-business-sdk) includes business catalogue/partner interfaces; that does not establish personal-account Marketplace publishing support. The submit controls are disabled. No HiBid/Facebook/Kijiji passwords are requested or stored. An approval is not a receipt and does not claim a bid/ad was submitted. No external phone notifications are configured; this is a browser inbox, not push messaging.
+
+`dealhunter/action_executor.py` defines an internal adapter contract for future reviewed integrations, with an empty registry. A genuine connector must explicitly support the action and account type, securely authenticate, preserve the approved fingerprint, revalidate live CAD bid/fees/open state, and support idempotency. Approved photo bytes are checked against their hashes. Execution claims are transactional; an interrupted/uncertain submission becomes `unknown` or stays `executing`, blocking automatic retries on the same resource. Success requires a provider receipt. Tests use fake adapters only. Do not register a browser-login workaround or assume a business catalogue endpoint can publish personal ads.
+
+### Local market evidence
+
+No live marketplace feed is currently connected. The research agent analyzes evidence you supply; it does not independently certify it. Each JSON record needs `platform` (`Facebook Marketplace` or `Kijiji`), a canonical `url` with item/ad ID, exact `model`, equivalent `condition` matching the saved inspection, `currency: "CAD"`, `centre_postal`, `distance_km`, `status`, and timezone-qualified ISO `observed_at`. Distances must be measured from the selected watchlist postal code (default L7A 4X1) and be within 50 km. Duplicate IDs across URL aliases are excluded. Uploads are limited to 1 MB and 2,000 records.
+
+A completed sale additionally needs `sale_verified: true`, nonempty `sale_evidence`, actual `sold_price`, `listed_at` and `sold_at`. Actual sale and observation must be within 30 days; listed <= sold <= observed <= now. Active records use `status: "active"` and `asking_price`, observed within seven days. Disappeared/removed ads, asking prices, changed models/conditions and unverified sales do not establish completed sales.
+
+At least three accepted sales are required to report price and historical days-to-sell quartiles. Fewer records return insufficient evidence, not an invented prediction. Asking-price summaries stay separate. Reported confidence is sample size, not statistical forecast confidence. Sold-only durations omit unsold listings and can be optimistic; sample sales per day are not population demand or a guaranteed selling time. With multiple claimed conditions, select one equivalent retail-source condition first. A future live source must provide permitted access, actual sale evidence, distances and dates before these limits can be relaxed.
+
+### Worker and durable hosting
+
+```sh
+# Use the same environment variables and actual persistent SQLite file as the app.
+python -m dealhunter.worker --owner alice          # one queued job
+python -m dealhunter.worker --owner alice --loop   # poll queued jobs every five seconds
+```
+
+The worker reads environment variables, not Streamlit Secrets. Provide `DEAL_HUNTER_DB` on a real private persistent volume and `REEFAPI_KEY` securely to both processes. The username must correspond to the intended app owner. Queue processing never approves or externally executes actions. There is no recurring discovery schedule; only explicitly queued jobs run. If a worker dies mid-job, its running job needs operator review; it is not silently retried. Use an always-on host/supervisor for unattended queue processing. Streamlit Community Cloud can sleep and its local files are ephemeral, so it cannot guarantee durable background operation. Preserve history before changing database paths. Database schema additions are additive and keep existing inspections/watchlists.
+
+Agent tests cover comparable filtering/deduplication, insufficient evidence, job dependencies, owner isolation, scout filtering/budgets, profit blocking, exact approvals, expiry, changed live costs/content, asset rights, personal-account compatibility, receipts and uncertain-outcome retry protection. No live bids or ads are used in tests.
