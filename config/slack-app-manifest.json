@@ -1,0 +1,31 @@
+{
+  "display_information": {
+    "name": "HiBid Deal Hunter",
+    "description": "Private deal alerts, exact-action approvals and agent inbox",
+    "background_color": "#16324f"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "HiBid Deal Hunter",
+      "always_online": false
+    },
+    "slash_commands": [
+      {
+        "command": "/deals",
+        "description": "Private HiBid agent inbox and approval review",
+        "usage_hint": "help | status | jobs | actions | note MESSAGE",
+        "should_escape": false
+      }
+    ]
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": ["chat:write", "commands", "groups:read"]
+    }
+  },
+  "settings": {
+    "interactivity": {"is_enabled": true},
+    "socket_mode_enabled": true,
+    "org_deploy_enabled": false
+  }
+}

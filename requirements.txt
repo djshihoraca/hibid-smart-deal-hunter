@@ -2,3 +2,5 @@ streamlit>=1.45,<2
 requests>=2.32,<3
 Pillow>=10.4,<13
 pytest>=8,<10
+slack-sdk>=3.33,<4
+websocket-client>=1.8,<2

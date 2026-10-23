@@ -272,3 +272,15 @@ def test_agent_scout_queues_numeric_categories(configured, monkeypatch):
     assert not at.exception
     job=store.claim_agent_job('alice')
     assert job['agent']=='Scout' and job['payload']['category_ids']==[10,20]
+
+
+def test_slack_notes_and_delivery_status_stay_private(configured):
+    store=Store(configured)
+    store.add_agent_note('alice','Slack T123/U123','Check the charger before buying.')
+    store.add_agent_note('bob','Slack T123/U999','Bob private note must not leak.')
+    store.enqueue_slack_notification('test-route','alice','action:1',{'text':'private'})
+    at=login()
+    assert not at.exception
+    texts='\n'.join(x.value for x in at.text)
+    assert 'Check the charger before buying.' in texts
+    assert 'Bob private note' not in texts
