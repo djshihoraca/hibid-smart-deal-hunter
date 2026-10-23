@@ -71,6 +71,17 @@ def render_operations(store, owner, reef_key=''):
                 st.error(job['error'])
             if job.get('result'):
                 st.json(job['result'])
+    with st.expander('Slack communication and delivery status'):
+        st.caption('The optional Slack Socket Mode worker uses a configured private channel. Approval records intent only. Slack notes do not change job instructions.')
+        delivery = store.slack_delivery_status(owner)
+        if delivery:
+            st.json(delivery)
+            st.caption('Unknown or sending deliveries require operator review; they are not automatically resent. Use /deals status in Slack to request current information.')
+        else:
+            st.caption('No Slack notifications recorded. Configure the separate listener to enable delivery.')
+        for note in store.agent_notes(owner):
+            st.text(f"Note #{note['id']} · {note['created_at']} · {note['source']}")
+            st.text(note['content'])
     st.subheader('Exact-action approval inbox')
     actions = store.agent_actions(owner)
     if not actions:

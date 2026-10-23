@@ -69,8 +69,9 @@ def database_path(configured=None, legacy_directory=None):
 
 
 class Store:
-    def __init__(self, path):
+    def __init__(self, path, timeout=15):
         self.path = Path(path)
+        self.timeout = timeout
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         except OSError as exc:
@@ -106,6 +107,18 @@ class Store:
                 CREATE TABLE IF NOT EXISTS scout_budget (
                     owner TEXT NOT NULL, day TEXT NOT NULL, calls INTEGER NOT NULL,
                     PRIMARY KEY(owner,day));
+                CREATE TABLE IF NOT EXISTS slack_routes (
+                    route TEXT PRIMARY KEY, activated_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS slack_outbox (
+                    id INTEGER PRIMARY KEY, route TEXT NOT NULL, owner TEXT NOT NULL,
+                    event_key TEXT NOT NULL, payload TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL,
+                    message_ts TEXT, UNIQUE(route,event_key));
+                CREATE TABLE IF NOT EXISTS slack_requests (
+                    request_key TEXT PRIMARY KEY, created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS agent_notes (
+                    id INTEGER PRIMARY KEY, owner TEXT NOT NULL, source TEXT NOT NULL,
+                    content TEXT NOT NULL, created_at TEXT NOT NULL);
                 """)
                 if 'receipt' not in {r[1] for r in conn.execute('PRAGMA table_info(agent_actions)')}:
                     conn.execute('ALTER TABLE agent_actions ADD COLUMN receipt TEXT')
@@ -118,7 +131,7 @@ class Store:
 
     @contextmanager
     def connect(self):
-        conn = sqlite3.connect(self.path, timeout=15)
+        conn = sqlite3.connect(self.path, timeout=self.timeout)
         conn.execute("PRAGMA foreign_keys=ON")
         try:
             with conn:
@@ -313,3 +326,49 @@ class Store:
             if not changed:
                 raise ValueError('Action is not executing for this user')
             conn.execute('INSERT INTO agent_events(owner,action_id,event,created_at) VALUES(?,?,?,?)', (owner, identifier, status, utcnow()))
+
+    def activate_slack_route(self, route):
+        with self.connect() as conn:
+            conn.execute('INSERT OR IGNORE INTO slack_routes VALUES(?,?)', (route, utcnow()))
+            return conn.execute('SELECT activated_at FROM slack_routes WHERE route=?', (route,)).fetchone()[0]
+
+    def enqueue_slack_notification(self, route, owner, event_key, payload):
+        with self.connect() as conn:
+            conn.execute('INSERT OR IGNORE INTO slack_outbox(route,owner,event_key,payload,created_at) VALUES(?,?,?,?,?)',
+                         (route, self.owner(owner), event_key, json.dumps(payload), utcnow()))
+
+    def claim_slack_notification(self, route, owner):
+        with self.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute("SELECT id,payload FROM slack_outbox WHERE route=? AND owner=? AND status='pending' ORDER BY id LIMIT 1",
+                               (route, self.owner(owner))).fetchone()
+            if not row:
+                return None
+            conn.execute("UPDATE slack_outbox SET status='sending' WHERE id=?", (row[0],))
+            return {'id': row[0], 'payload': json.loads(row[1])}
+
+    def finish_slack_notification(self, route, owner, identifier, message_ts=None):
+        with self.connect() as conn:
+            conn.execute("UPDATE slack_outbox SET status=?,message_ts=? WHERE route=? AND owner=? AND id=? AND status='sending'",
+                         ('sent' if message_ts else 'unknown', message_ts, route, self.owner(owner), identifier))
+
+    def slack_delivery_status(self, owner):
+        with self.connect() as conn:
+            return [{'status': status, 'count': count} for status, count in conn.execute(
+                'SELECT status,COUNT(*) FROM slack_outbox WHERE owner=? GROUP BY status', (self.owner(owner),))]
+
+    def claim_slack_request(self, key):
+        with self.connect() as conn:
+            return bool(conn.execute('INSERT OR IGNORE INTO slack_requests VALUES(?,?)', (key, utcnow())).rowcount)
+
+    def add_agent_note(self, owner, source, content):
+        if not isinstance(content, str) or not content.strip() or len(content) > 4000:
+            raise ValueError('A note must contain 1–4,000 characters')
+        with self.connect() as conn:
+            return conn.execute('INSERT INTO agent_notes(owner,source,content,created_at) VALUES(?,?,?,?)',
+                                (self.owner(owner), source, content.strip(), utcnow())).lastrowid
+
+    def agent_notes(self, owner):
+        with self.connect() as conn:
+            return [{'id': i, 'source': s, 'content': c, 'created_at': t} for i, s, c, t in conn.execute(
+                'SELECT id,source,content,created_at FROM agent_notes WHERE owner=? ORDER BY id DESC LIMIT 100', (self.owner(owner),))]
